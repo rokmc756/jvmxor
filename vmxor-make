@@ -1,0 +1,126 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Basename;
+use File::Path qw(make_path);
+use FindBin;
+
+# return the last byte of the IP address for hostname from /etc/hosts
+sub get_ip_byte {
+  my ($hostname) = @_;
+  my $regex = qr{^\s*(?:\d+\.){3}(\d+)\s+$hostname\b};
+  open(my $fh, '<', '/etc/hosts') or die "Can't open /etc/hosts: $!";
+  my @lines = <$fh>;
+  close($fh);
+  foreach (@lines) { if (/$regex/) { return $1; } }
+  return undef;
+}
+
+# make a floppy disk image file
+sub make_floppy {
+  my ($srcdir, $imgfile) = @_;
+
+  print("\nMaking $imgfile ...\n");
+  0 == system("dd if=/dev/zero bs=1024 count=1440 > '$imgfile'") or die;
+  my $dev = qx(hdiutil attach '$imgfile' -nomount) or die;
+  $dev = (split('\t', $dev))[0];
+  chomp($dev);
+  my $volname = "AUTOFLOP";
+  0 == system("newfs_msdos -f 1440 -v $volname $dev > /dev/null") or die;
+  0 == system("hdiutil mountvol $dev") or die;
+  0 == system("cp $srcdir/* /Volumes/$volname/") or die;
+  0 == system("hdiutil detach $dev > /dev/null") or die;
+}
+
+sub template_substitute {
+  my ($infilepath, $outfilepath, $values) = @_;
+  open(my $infh, '<', $infilepath) or return;
+  my @lines = <$infh>;
+  close($infh);
+  open(my $outfh, '>', $outfilepath) or return;
+  foreach my $line (@lines) {
+    for my $key (keys %$values) {
+      my $value = $values->{$key};
+      $value = "" unless defined($value);
+      $line =~ s/\${$key}/$value/g;
+    }
+    print $outfh $line;
+  }
+  close($outfh);
+}
+
+my $os = undef;
+my $gb = 8; # size in GB for virtual hard disk
+my $autoflopdir = undef;
+my $dvd0 = undef;
+my $dvd1 = undef;
+my $dest = $ENV{"HOME"} . "/Documents/Virtual Machines.localized";
+my $vmxin = $FindBin::Bin . "/default.vmx.template";
+
+my $results = GetOptions( "os=s"   => \$os,
+                          "gb=s" => \$gb,
+                          "flop=s" => \$autoflopdir,
+                          "dvd0=s" => \$dvd0,
+                          "dvd1=s" => \$dvd1,
+                          "dest=s" => \$dest,
+                          "vmxin=s" => \$vmxin );
+
+my $vmname = shift @ARGV;
+
+unless ( defined($vmname) && defined($dvd0) && defined($os) ) {
+  print STDERR "Make new virtual machine.\n";
+  print STDERR "Usage:\n";
+  print STDERR "\t" . basename($0) . " VMNAME \\\n";
+  print STDERR "\t\t" . "--os {opensuse|sled11|fedora|centos} \\\n";
+  print STDERR "\t\t" . "--dvd0 PATH [--dvd1 PATH] \\\n";
+  print STDERR "\t\t" . "[--flop DIR] \\\n";
+  print STDERR "\t\t" . "[--gb NUM] \\\n";
+  print STDERR "\t\t" . "[--dest DESTDIR] \\\n";
+  print STDERR "\t\t" . "[--vmxin TEMPLATEPATH]\n";
+  exit;
+}
+
+unless ( defined($autoflopdir) ) {
+  $autoflopdir = "$os";
+}
+(-d $autoflopdir) or die "$autoflopdir directory not found.";
+(-f $dvd0) or die "$dvd0 DVD file not found.";
+
+my $dir = "$dest/$vmname.vmwarevm";
+if (-e $dir) {
+  print STDERR "$dir\nalready exists. Delete it manually if it's invalid.\n";
+  exit 1;
+}
+
+my $ip_byte = get_ip_byte($vmname);
+if (!defined($ip_byte)) {
+  print STDERR "Unable to find IP address in /etc/hosts for $vmname.\n";
+  print STDERR "Run vmxor-dhcp to configure IP addresses,\n";
+  print STDERR " or configure IP addresses manually.\n";
+  exit 1;
+}
+
+print("Making $vmname\n");
+make_path($dir) or die;
+
+my $flop = "$dir/autoflop.img";
+make_floppy($autoflopdir, $flop);
+
+0 == system("vmware-vdiskmanager -c -s ${gb}Gb -a lsilogic -t 1 '$dir/$vmname.vmdk'") or die;
+
+my %values = (
+  vmname => $vmname,
+  floppy0 => $flop,
+  dvd0 => $dvd0,
+  dvd1 => $dvd1,
+  dvd1present => (defined($dvd1) ? "TRUE" : "FALSE"),
+  hexipbyte => sprintf("%X", $ip_byte),
+  guestos => ($os eq "sled11" || $os eq "sle11" ? "sles11" : $os)
+);
+template_substitute($vmxin, "$dir/$vmname.vmx", \%values) or die;
+
+0 == system("vmrun -T fusion start '$dir/$vmname.vmx'") or die;
+
+print("\nWait for vitual machine to boot with installation DVD.\n");
+
